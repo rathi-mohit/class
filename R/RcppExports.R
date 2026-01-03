@@ -5,3 +5,7 @@ k_selection_cpp <- function(X, y, k, intercept = FALSE) {
     .Call(`_SUBLIME_k_selection_cpp`, X, y, k, intercept)
 }
 
+SRHT_cpp <- function(X, y, r) {
+    .Call(`_SUBLIME_SRHT_cpp`, X, y, r)
+}
+

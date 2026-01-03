@@ -18,7 +18,7 @@ Last column is assumed to be response.}
 
 \item{intercept}{Logical; whether first column is intercept.}
 
-\item{header}{Logical; whether the csv files contains a header row}
+\item{header}{Logical; whether the csv files contains a header row.}
 }
 \value{
 A list with:
