@@ -25,9 +25,23 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// SRHT_cpp
+Rcpp::List SRHT_cpp(Eigen::MatrixXd X, Eigen::VectorXd y, int r);
+RcppExport SEXP _SUBLIME_SRHT_cpp(SEXP XSEXP, SEXP ySEXP, SEXP rSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Eigen::MatrixXd >::type X(XSEXP);
+    Rcpp::traits::input_parameter< Eigen::VectorXd >::type y(ySEXP);
+    Rcpp::traits::input_parameter< int >::type r(rSEXP);
+    rcpp_result_gen = Rcpp::wrap(SRHT_cpp(X, y, r));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_SUBLIME_k_selection_cpp", (DL_FUNC) &_SUBLIME_k_selection_cpp, 4},
+    {"_SUBLIME_SRHT_cpp", (DL_FUNC) &_SUBLIME_SRHT_cpp, 3},
     {NULL, NULL, 0}
 };
 
