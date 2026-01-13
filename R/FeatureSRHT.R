@@ -21,7 +21,7 @@ bin_count <- 10
 
 # --- 2. Compile ---
 message("Compiling C++ source...")
-sourceCpp("Feature_selection.cpp") 
+sourceCpp("FeatureSRHT.cpp") 
 
 # --- 3. Print Helper (SHOWS ALL COEFFICIENTS) ---
 print_results <- function(res_list, title_str) {
@@ -99,3 +99,4 @@ run_isrht_wrapper <- function(user_csv_path = NULL, run_synthetic = TRUE) {
 # --- Execute ---
 run_isrht_wrapper()
 run_isrht_wrapper("chem_data.csv", run_synthetic = FALSE)
+
