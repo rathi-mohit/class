@@ -1,17 +1,11 @@
-// [[Rcpp::plugins(openmp)]]
-// [[Rcpp::depends(RcppEigen)]]
-
-
-#include "FeatureSRHT.hpp" 
+#include "FeatureSRHT.hpp"
 #include <omp.h>
+#include <iostream>
 
-using namespace Rcpp;
 using namespace Eigen;
 
+// --- Helper Implementations ---
 
-// --- Helper Functions Implementation ---
-
-// 1. Iterative Fast Walsh-Hadamard Transform
 void fwht_iterative(double* a, int n) {
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += 2 * len) {
@@ -25,13 +19,11 @@ void fwht_iterative(double* a, int n) {
     }
 }
 
-// 2. Parallel Scaling to Range [-1, 1]
-void scaleData(Eigen::MatrixXd& X) {
+double compute_scale(const Eigen::MatrixXd& X) {
     double max_val = 0.0;
     int n = X.rows();
     int d = X.cols();
 
-    // Parallel Max Reduction
     #pragma omp parallel for reduction(max:max_val)
     for(int i=0; i<n; ++i) {
         for(int j=0; j<d; ++j) {
@@ -39,18 +31,36 @@ void scaleData(Eigen::MatrixXd& X) {
             if(std::isfinite(abs_v) && abs_v > max_val) max_val = abs_v;
         }
     }
-    
-    // Parallel Scaling
-    if(max_val > 1e-9) {
-        double scale = 1.0 / max_val;
-        #pragma omp parallel for
-        for(int i=0; i<n; ++i) {
-            for(int j=0; j<d; ++j) {
-                if(std::isfinite(X(i,j))) X(i,j) *= scale;
-                else X(i,j) = 0.0;
-            }
-        }
+    return (max_val > 1e-9) ? (1.0 / max_val) : 1.0;
+}
+
+Eigen::MatrixXd apply_rotation(Eigen::MatrixXd X, double scale, int seed) {
+    X *= scale;
+    int n = X.rows();
+    int d = X.cols();
+    int padded_d = nextPowerOfTwo(d);
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<> dist(0, 1);
+    std::vector<double> signs(padded_d);
+    for(int j=0; j<padded_d; ++j) {
+        signs[j] = (dist(rng) == 0) ? 1.0 : -1.0;
     }
+
+    using MatrixRowMaj = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    MatrixRowMaj X_rotated = MatrixRowMaj::Zero(n, padded_d);
+    X_rotated.block(0, 0, n, d) = X;
+
+    double transform_scale = 1.0 / std::sqrt((double)padded_d);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < d; j++) X_rotated(i, j) *= signs[j];
+        fwht_iterative(X_rotated.row(i).data(), padded_d);
+    }
+    
+    X_rotated *= transform_scale;
+    return X_rotated; 
 }
 
 int nextPowerOfTwo(int n) {
@@ -58,7 +68,6 @@ int nextPowerOfTwo(int n) {
     return std::pow(2, std::ceil(std::log2(n)));
 }
 
-// Binning for Supervised Method
 std::vector<int> bin_continuous_targets(const Eigen::VectorXd& y, int n_bins) {
     int n = y.size();
     std::vector<int> labels(n);
@@ -76,17 +85,15 @@ std::vector<int> bin_continuous_targets(const Eigen::VectorXd& y, int n_bins) {
     return labels;
 }
 
-// Robust OLS Solver
 OLSResult solve_ols(const Eigen::MatrixXd& X, const Eigen::VectorXd& y) {
     int n = X.rows();
     int k = X.cols();
     if (n == 0 || k == 0) return {0.0, Eigen::VectorXd::Zero(k+1)};
 
     Eigen::MatrixXd X_bias(n, k + 1);
-    X_bias.col(0) = Eigen::VectorXd::Ones(n); // Intercept
+    X_bias.col(0) = Eigen::VectorXd::Ones(n); 
     X_bias.block(0, 1, n, k) = X;
     
-    // Use ColPivHouseholderQr for stability
     Eigen::VectorXd w = X_bias.colPivHouseholderQr().solve(y);
     
     if (!w.allFinite()) return {0.0, Eigen::VectorXd::Zero(k+1)};
@@ -102,51 +109,42 @@ OLSResult solve_ols(const Eigen::MatrixXd& X, const Eigen::VectorXd& y) {
     return {r2, w};
 }
 
+std::pair<double, double> predict_ols(const Eigen::MatrixXd& X_test, const Eigen::VectorXd& y_test, 
+                                      const Eigen::VectorXd& beta, const std::vector<int>& indices) {
+    if (X_test.rows() == 0) return {NA_REAL, NA_REAL}; 
 
-
-Eigen::MatrixXd ISRHT_Core::rotateData(Eigen::MatrixXd X, int seed) {
-    // 1. Parallel Scaling
-    scaleData(X);
-
-    std::mt19937 rng(seed);
-    int n = X.rows();
-    int d = X.cols();
-    int padded_d = nextPowerOfTwo(d);
+    int n = X_test.rows();
+    int r = indices.size();
     
-    // 2. Generate Global Signs (Diagonal D)
-    std::uniform_int_distribution<> dist(0, 1);
-    std::vector<double> signs(padded_d);
-    for(int j=0; j<padded_d; ++j) {
-        signs[j] = (dist(rng) == 0) ? 1.0 : -1.0;
+    Eigen::MatrixXd X_subset(n, r);
+    for(int j=0; j<r; ++j) {
+        X_subset.col(j) = X_test.col(indices[j]);
     }
 
-    // 3. OPTIMIZATION: Use Row-Major Layout
-    using MatrixRowMaj = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    MatrixRowMaj X_rotated = MatrixRowMaj::Zero(n, padded_d);
-    
-    // Copy input block
-    X_rotated.block(0, 0, n, d) = X;
-    
-    double scale = 1.0 / std::sqrt((double)padded_d);
-    
-    // 4. Data Parallel Rotation
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) {
-        // Apply Signs
-        for (int j = 0; j < d; j++) {
-            X_rotated(i, j) *= signs[j];
-        }
-        // Apply Iterative FWHT (Fast on contiguous memory)
-        fwht_iterative(X_rotated.row(i).data(), padded_d);
-    }
-    
-    X_rotated *= scale;
+    Eigen::MatrixXd X_bias(n, r + 1);
+    X_bias.col(0) = Eigen::VectorXd::Ones(n);
+    X_bias.block(0, 1, n, r) = X_subset;
 
-    // Implicitly converts back to Col-Major for standard Eigen operations
-    return X_rotated; 
+    Eigen::VectorXd y_pred = X_bias * beta;
+    Eigen::VectorXd resid = y_test - y_pred;
+    double mse = resid.array().square().mean();
+    
+    double y_mean = y_test.mean();
+    double ss_tot = (y_test.array() - y_mean).square().sum();
+    double ss_res = resid.array().square().sum();
+    double r2 = (ss_tot > 1e-9) ? (1.0 - ss_res/ss_tot) : 0.0;
+
+    return {r2, mse};
 }
 
-std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_uniform(const Eigen::MatrixXd& X_rot, int r, std::mt19937& rng) {
+// --- Class Implementation ---
+
+Eigen::MatrixXd FeatureSRHT_Core::rotateData(Eigen::MatrixXd X, int seed) {
+    double s = compute_scale(X);
+    return apply_rotation(X, s, seed);
+}
+
+std::pair<Eigen::MatrixXd, std::vector<int>> FeatureSRHT_Core::fit_transform_uniform(const Eigen::MatrixXd& X_rot, int r, std::mt19937& rng) {
     int n = X_rot.rows();
     int d = X_rot.cols();
     std::vector<int> indices(d);
@@ -160,7 +158,7 @@ std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_uniform(c
     return {X_new, indices};
 }
 
-std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_top_r(const Eigen::MatrixXd& X_rot, int r) {
+std::pair<Eigen::MatrixXd, std::vector<int>> FeatureSRHT_Core::fit_transform_top_r(const Eigen::MatrixXd& X_rot, int r) {
     int d = X_rot.cols();
     Eigen::VectorXd norms = X_rot.colwise().squaredNorm();
     std::vector<std::pair<double, int>> col_norms(d);
@@ -179,7 +177,7 @@ std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_top_r(con
     return {X_new, indices};
 }
 
-std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_leverage(const Eigen::MatrixXd& X_rot, int r, std::mt19937& rng) {
+std::pair<Eigen::MatrixXd, std::vector<int>> FeatureSRHT_Core::fit_transform_leverage(const Eigen::MatrixXd& X_rot, int r, std::mt19937& rng) {
     int n = X_rot.rows();
     int d = X_rot.cols();
     Eigen::VectorXd norms = X_rot.colwise().squaredNorm();
@@ -187,11 +185,8 @@ std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_leverage(
     std::vector<double> weights(d);
     double max_norm = 0.0;
     
-    // Find max for safe scaling
     for(int i=0; i<d; ++i) {
-        if(std::isfinite(norms[i])) {
-            if(norms[i] > max_norm) max_norm = norms[i];
-        }
+        if(std::isfinite(norms[i]) && norms[i] > max_norm) max_norm = norms[i];
     }
 
     if(max_norm > 1e-100) { 
@@ -225,7 +220,7 @@ std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_leverage(
     return {X_new, indices};
 }
 
-std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_supervised(const Eigen::MatrixXd& X_rot, const std::vector<int>& labels, int r, double a_param) {
+std::pair<Eigen::MatrixXd, std::vector<int>> FeatureSRHT_Core::fit_transform_supervised(const Eigen::MatrixXd& X_rot, const std::vector<int>& labels, int r, double a_param) {
     int n = X_rot.rows();
     int d = X_rot.cols();
     int max_label = *std::max_element(labels.begin(), labels.end());
@@ -272,59 +267,4 @@ std::pair<Eigen::MatrixXd, std::vector<int>> ISRHT_Core::fit_transform_supervise
         X_new.col(j) = X_rot.col(indices[j]);
     }
     return {X_new, indices};
-}
-
-// --- Rcpp Export ---
-
-// [[Rcpp::export]]
-List run_isrht_benchmark(Eigen::MatrixXd X, Eigen::VectorXd y, int r, int bins) {
-    int seed = 123;
-    Eigen::MatrixXd X_rot = ISRHT_Core::rotateData(X, seed);
-    int total_d = X_rot.cols();
-    std::vector<int> labels = bin_continuous_targets(y, bins);
-    
-    std::vector<BenchmarkResult> all_results(4);
-    
-    // Parallel Sections: Run all 4 methods concurrently
-    #pragma omp parallel sections
-    {
-        #pragma omp section 
-        {
-            std::mt19937 thread_rng(seed + 1);
-            auto pair = ISRHT_Core::fit_transform_uniform(X_rot, r, thread_rng);
-            OLSResult res = solve_ols(pair.first, y);
-            all_results[0] = {"Uniform", res.r2, res.coeffs, pair.second, total_d};
-        }
-        #pragma omp section
-        {
-            auto pair = ISRHT_Core::fit_transform_top_r(X_rot, r);
-            OLSResult res = solve_ols(pair.first, y);
-            all_results[1] = {"Top-r", res.r2, res.coeffs, pair.second, total_d};
-        }
-        #pragma omp section
-        {
-            std::mt19937 thread_rng(seed + 2);
-            auto pair = ISRHT_Core::fit_transform_leverage(X_rot, r, thread_rng);
-            OLSResult res = solve_ols(pair.first, y);
-            all_results[2] = {"Leverage", res.r2, res.coeffs, pair.second, total_d};
-        }
-        #pragma omp section
-        {
-            auto pair = ISRHT_Core::fit_transform_supervised(X_rot, labels, r, 1.0);
-            OLSResult res = solve_ols(pair.first, y);
-            all_results[3] = {"Supervised", res.r2, res.coeffs, pair.second, total_d};
-        }
-    }
-    
-    List output(4);
-    for(int i=0; i<4; ++i) {
-        output[i] = List::create(
-            Named("Method") = all_results[i].method,
-            Named("R_Squared") = all_results[i].r2,
-            Named("Coefficients") = all_results[i].coeffs,
-            Named("Indices") = all_results[i].indices,
-            Named("TotalFeatures") = all_results[i].total_features
-        );
-    }
-    return output;
 }
