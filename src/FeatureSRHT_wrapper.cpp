@@ -1,181 +1,43 @@
 // [[Rcpp::plugins(openmp)]]
 // [[Rcpp::depends(RcppEigen)]]
-
+#include "FeatureSRHT.hpp"
 #include <RcppEigen.h>
 #include <omp.h>
-#include "FeatureSRHT.hpp"
+#include <chrono>
 
 using namespace Rcpp;
+using namespace Eigen;
+using namespace std::chrono;
 
-// Helper to expand reduced coeffs to full dimension (Total_D + 1)
-Eigen::VectorXd expand_coeffs(const Eigen::VectorXd& reduced_coeffs, 
-                              const std::vector<int>& indices, 
-                              int total_d) {
-    Eigen::VectorXd full_coeffs = Eigen::VectorXd::Zero(total_d + 1);
-    
-    // Intercept is always at index 0
-    if (reduced_coeffs.size() > 0) {
-        full_coeffs[0] = reduced_coeffs[0];
-    }
-    
-    // Map weights (reduced_coeffs[1...r] -> full_coeffs[indices[i]+1])
-    for (size_t i = 0; i < indices.size(); ++i) {
-        if (i + 1 < (size_t)reduced_coeffs.size()) {
-            full_coeffs[indices[i] + 1] = reduced_coeffs[i + 1];
-        }
-    }
-    return full_coeffs;
-}
+double get_time() { return duration_cast<duration<double>>(high_resolution_clock::now().time_since_epoch()).count(); }
 
 // [[Rcpp::export]]
-List run_featuresrht_wrapper(Eigen::MatrixXd X, Eigen::VectorXd y, 
-                             Nullable<Eigen::MatrixXd> X_test_in, 
-                             Nullable<Eigen::VectorXd> y_test_in,
-                             int r, int bins,
-                             bool run_uni, bool run_top, bool run_lev, bool run_sup) {
-    
+List run_featuresrht_wrapper(Eigen::MatrixXd X, Eigen::VectorXd y, Rcpp::Nullable<Eigen::MatrixXd> X_test_in, Rcpp::Nullable<Eigen::VectorXd> y_test_in, int r, int bins, double alpha, bool run_uni, bool run_top, bool run_lev, bool run_sup) {
     int seed = 123;
-    
-    // 1. Compute Scale from Training Data
+    double t0 = get_time();
     double scale = compute_scale(X);
-    
-    // 2. Rotate Training Data
-    Eigen::MatrixXd X_rot = apply_rotation(X, scale, seed);
+    MatrixXd X_rot = apply_rotation(X, scale, seed);
+    double time_rot = get_time() - t0;
     int total_d = X_rot.cols();
-    std::vector<int> labels = bin_continuous_targets(y, bins);
+    std::vector<int> labels = bin_continuous_targets_quantile(y, bins);
+    std::vector<BenchmarkResult> res(4);
     
-    // 3. Handle Test Data
-    bool has_test = X_test_in.isNotNull() && y_test_in.isNotNull();
-    Eigen::MatrixXd X_test_rot; 
-    Eigen::VectorXd y_test_vec;
-
-    if (has_test) {
-        Eigen::MatrixXd X_test_mat = as<Eigen::MatrixXd>(X_test_in);
-        y_test_vec = as<Eigen::VectorXd>(y_test_in);
-        X_test_rot = apply_rotation(X_test_mat, scale, seed);
-    }
-
-    std::vector<BenchmarkResult> all_results(4);
-    for(auto& res : all_results) res.executed = false;
-
-    // Parallel Sections with Conditional Execution
     #pragma omp parallel sections
     {
-        #pragma omp section 
-        {
-            if (run_uni) {
-                std::mt19937 thread_rng(seed + 1);
-                auto pair = FeatureSRHT_Core::fit_transform_uniform(X_rot, r, thread_rng);
-                OLSResult res = solve_ols(pair.first, y);
-                
-                double t_r2 = NA_REAL, t_mse = NA_REAL;
-                if (has_test) {
-                    auto preds = predict_ols(X_test_rot, y_test_vec, res.coeffs, pair.second);
-                    t_r2 = preds.first; t_mse = preds.second;
-                }
-                
-                // Expand coeffs before saving
-                Eigen::VectorXd full = expand_coeffs(res.coeffs, pair.second, total_d);
-                all_results[0] = {"Uniform", res.r2, t_r2, t_mse, full, pair.second, total_d, true};
-            }
-        }
         #pragma omp section
-        {
-            if (run_top) {
-                auto pair = FeatureSRHT_Core::fit_transform_top_r(X_rot, r);
-                OLSResult res = solve_ols(pair.first, y);
-                
-                double t_r2 = NA_REAL, t_mse = NA_REAL;
-                if (has_test) {
-                    auto preds = predict_ols(X_test_rot, y_test_vec, res.coeffs, pair.second);
-                    t_r2 = preds.first; t_mse = preds.second;
-                }
-                
-                Eigen::VectorXd full = expand_coeffs(res.coeffs, pair.second, total_d);
-                all_results[1] = {"Top-r", res.r2, t_r2, t_mse, full, pair.second, total_d, true};
-            }
-        }
+        { if(run_uni) { double ts=get_time(); std::mt19937 rng(seed+1); auto p=FeatureSRHT_Core::fit_transform_uniform(X_rot, r, rng); double t_samp=get_time()-ts; double to=get_time(); auto o=solve_ols(p.first,y); double t_ols=get_time()-to; res[0]={"Uniform",o.r2,t_samp,t_ols,o.coeffs,p.second,total_d,true}; } }
         #pragma omp section
-        {
-            if (run_lev) {
-                std::mt19937 thread_rng(seed + 2);
-                auto pair = FeatureSRHT_Core::fit_transform_leverage(X_rot, r, thread_rng);
-                OLSResult res = solve_ols(pair.first, y);
-                
-                double t_r2 = NA_REAL, t_mse = NA_REAL;
-                if (has_test) {
-                    auto preds = predict_ols(X_test_rot, y_test_vec, res.coeffs, pair.second);
-                    t_r2 = preds.first; t_mse = preds.second;
-                }
-                
-                Eigen::VectorXd full = expand_coeffs(res.coeffs, pair.second, total_d);
-                all_results[2] = {"Leverage", res.r2, t_r2, t_mse, full, pair.second, total_d, true};
-            }
-        }
+        { if(run_top) { double ts=get_time(); auto p=FeatureSRHT_Core::fit_transform_top_r(X_rot, r); double t_samp=get_time()-ts; double to=get_time(); auto o=solve_ols(p.first,y); double t_ols=get_time()-to; res[1]={"Top-r",o.r2,t_samp,t_ols,o.coeffs,p.second,total_d,true}; } }
         #pragma omp section
-        {
-            if (run_sup) {
-                auto pair = FeatureSRHT_Core::fit_transform_supervised(X_rot, labels, r, 1.0);
-                OLSResult res = solve_ols(pair.first, y);
-                
-                double t_r2 = NA_REAL, t_mse = NA_REAL;
-                if (has_test) {
-                    auto preds = predict_ols(X_test_rot, y_test_vec, res.coeffs, pair.second);
-                    t_r2 = preds.first; t_mse = preds.second;
-                }
-                
-                Eigen::VectorXd full = expand_coeffs(res.coeffs, pair.second, total_d);
-                all_results[3] = {"Supervised", res.r2, t_r2, t_mse, full, pair.second, total_d, true};
-            }
-        }
+        { if(run_lev) { double ts=get_time(); std::mt19937 rng(seed+2); auto p=FeatureSRHT_Core::fit_transform_leverage(X_rot, r, rng); double t_samp=get_time()-ts; double to=get_time(); auto o=solve_ols(p.first,y); double t_ols=get_time()-to; res[2]={"Leverage",o.r2,t_samp,t_ols,o.coeffs,p.second,total_d,true}; } }
+        #pragma omp section
+        { if(run_sup) { double ts=get_time(); auto p=FeatureSRHT_Core::fit_transform_supervised(X_rot, labels, r, alpha); double t_samp=get_time()-ts; double to=get_time(); auto o=solve_ols(p.first,y); double t_ols=get_time()-to; res[3]={"Supervised",o.r2,t_samp,t_ols,o.coeffs,p.second,total_d,true}; } }
     }
-    
-    // Construct Return List
-    List output;
-    if (all_results[0].executed) {
-        output["Uniform"] = List::create(
-            Named("Method") = all_results[0].method,
-            Named("Train_R2") = all_results[0].train_r2,
-            Named("Test_R2") = all_results[0].test_r2,
-            Named("Test_MSE") = all_results[0].test_mse,
-            Named("Coefficients") = all_results[0].coeffs,
-            Named("Indices") = all_results[0].indices,
-            Named("TotalFeatures") = all_results[0].total_features
-        );
-    }
-    if (all_results[1].executed) {
-        output["Top-r"] = List::create(
-            Named("Method") = all_results[1].method,
-            Named("Train_R2") = all_results[1].train_r2,
-            Named("Test_R2") = all_results[1].test_r2,
-            Named("Test_MSE") = all_results[1].test_mse,
-            Named("Coefficients") = all_results[1].coeffs,
-            Named("Indices") = all_results[1].indices,
-            Named("TotalFeatures") = all_results[1].total_features
-        );
-    }
-    if (all_results[2].executed) {
-        output["Leverage"] = List::create(
-            Named("Method") = all_results[2].method,
-            Named("Train_R2") = all_results[2].train_r2,
-            Named("Test_R2") = all_results[2].test_r2,
-            Named("Test_MSE") = all_results[2].test_mse,
-            Named("Coefficients") = all_results[2].coeffs,
-            Named("Indices") = all_results[2].indices,
-            Named("TotalFeatures") = all_results[2].total_features
-        );
-    }
-    if (all_results[3].executed) {
-        output["Supervised"] = List::create(
-            Named("Method") = all_results[3].method,
-            Named("Train_R2") = all_results[3].train_r2,
-            Named("Test_R2") = all_results[3].test_r2,
-            Named("Test_MSE") = all_results[3].test_mse,
-            Named("Coefficients") = all_results[3].coeffs,
-            Named("Indices") = all_results[3].indices,
-            Named("TotalFeatures") = all_results[3].total_features
-        );
-    }
-    
-    return output;
+    List out;
+    auto pack = [&](BenchmarkResult& r) { return List::create(Named("Coefficients")=r.coeffs, Named("Indices")=r.indices, Named("Time_Rot")=time_rot, Named("Time_Sample")=r.time_sample, Named("Time_OLS")=r.time_ols); };
+    if(res[0].executed) out["Uniform"] = pack(res[0]);
+    if(res[1].executed) out["Top-r"] = pack(res[1]);
+    if(res[2].executed) out["Leverage"] = pack(res[2]);
+    if(res[3].executed) out["Supervised"] = pack(res[3]);
+    return out;
 }
