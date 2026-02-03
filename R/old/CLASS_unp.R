@@ -16,18 +16,12 @@
 #' @importFrom stats coef
 #' @importFrom stats lm.fit
 #' @import glmnet
-#' @import data.table
-#' @import foreach
-#' @import doParallel
-#' @import bigmemory
-#' @import parallel
-#' @import class
 #'
 #' @return A list with:
 #' \itemize{
 #' }
 #' @export
-CLASSp <- function(X = NULL, y = NULL, csv = NULL, header = FALSE, nSample = -1, nTimes = -1, k = -1) {
+CLASS_unp <- function(X = NULL, y = NULL, csv = NULL, header = FALSE, nSample = -1, nTimes = -1, k = -1) {
   if (nSample == -1) {
     stop("Check input CLASS(..., nSample = (pos int), ...")
   }
@@ -62,33 +56,18 @@ CLASSp <- function(X = NULL, y = NULL, csv = NULL, header = FALSE, nSample = -1,
     stop("nSample cannot be larger than number of rows in X")
   }
 
-  X_big <- as.big.matrix(x = X, type = "double", backingfile = "X.bin", descriptorfile = "X.desc")
-  X_desc <- describe(X_big)
+  freq_count <- rep(0, p)
 
-  y_big <- as.big.matrix(x = y, type = "double", backingfile = "y.bin", descriptorfile = "y.desc")
-  y_desc <- describe(y_big)
+  cat("\n")
+  for(i in 1:nTimes) {
+    data_sub <- fast_subsample(X, y, as.integer(nSample))
 
-  nC <- parallel::detectCores() - 1
-  cl <- makeCluster(nC)
-  registerDoParallel(cl)
-
-  accumulator <- function(acc, vec) {
-    acc + vec
-  }
-  freq_count <- foreach(i = 1:nTimes, .packages = c("bigmemory", "glmnet", "class"), .combine = accumulator) %dopar% {
-    X_ref <- attach.big.matrix(X_desc)
-    y_ref <- attach.big.matrix(y_desc)
-    set.seed(42 + i)
-    idx <- sample(seq_len(nrow(X_ref)), nSample)
-    X_sub <- X_ref[idx, , drop = FALSE]
-    y_sub <- y_ref[idx]
-
-    fit <- glmnet::cv.glmnet(x = X_sub, y = y_sub, alpha = 1)
+    fit <- glmnet::cv.glmnet(x = data_sub$X_subsampled, y = data_sub$y_subsampled, alpha = 1)
     coefs <- coef(fit, s = "lambda.min")[-1]
-    as.numeric(coefs != 0)
+
+    freq_count <- freq_count + as.numeric(coefs != 0)
+    if(i %% 10 == 0) cat(".")
   }
-  print(freq_count)
-  stopCluster(cl)
   cat("\n")
   kboss_res <- kBOSS(X, y, freq_count, k)
 
@@ -98,7 +77,7 @@ CLASSp <- function(X = NULL, y = NULL, csv = NULL, header = FALSE, nSample = -1,
 
   intercept_col <- rep(x = 1, times = nrow(X_final))
   X_ols <- cbind(intercept_col, X_final)
-  beta_hat <- qr.solve(X_ols, y_final)
+  beta_hat <- betaOLS_closed(X_ols, y_final)
 
   intercept_hat <- beta_hat[1]
   beta_reduced  <- beta_hat[-1]
@@ -111,12 +90,9 @@ CLASSp <- function(X = NULL, y = NULL, csv = NULL, header = FALSE, nSample = -1,
 
   mse <- mean(residuals^2)
   r_squared <- 1 - sum(residuals^2) / sum((y - mean(y))^2)
-  print(mse)
+
   return(invisible(list(
-    X_f = X_final,
-    y_f = y_final,
-    intercept_hat = intercept_hat,
-    beta_final = final_beta,
+    beta = c(Intercept = intercept_hat, final_beta),
     selected_indices = active_vars + 1,
     feature_counts = freq_count,
     mse = mse,
